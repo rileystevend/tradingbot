@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+Server-optimized Alpaca Trading Bot for OCI VM deployment
+"""
+
 import alpaca_trade_api as tradeapi
 import pandas as pd
 import numpy as np
@@ -5,65 +10,227 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import time
 import logging
+import os
+import json
+import signal
+import sys
 from typing import Dict, List, Tuple, Optional
 import asyncio
 import websocket
-import json
 from concurrent.futures import ThreadPoolExecutor
 import talib
+from dotenv import load_dotenv
+import schedule
+import sqlite3
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Load environment variables
+load_dotenv()
 
-class AlpacaTradingBot:
-    def __init__(self, api_key: str, secret_key: str, paper_trading: bool = True):
-        """
-        Initialize the Alpaca trading bot
+class TradingBotLogger:
+    def __init__(self, log_file='trading_bot.log'):
+        self.logger = logging.getLogger('TradingBot')
+        self.logger.setLevel(logging.INFO)
         
-        Args:
-            api_key: Alpaca API key
-            secret_key: Alpaca secret key
-            paper_trading: Whether to use paper trading (default: True)
-        """
+        # File handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        
+        # Console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        
+        # Formatter
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        console_handler.setFormatter(formatter)
+        
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(console_handler)
+    
+    def get_logger(self):
+        return self.logger
+
+class DatabaseManager:
+    def __init__(self, db_path='trading_bot.db'):
+        self.db_path = db_path
+        self.init_database()
+    
+    def init_database(self):
+        """Initialize SQLite database for storing trades and performance"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Trades table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price REAL NOT NULL,
+                strategy TEXT NOT NULL,
+                pnl REAL DEFAULT 0,
+                status TEXT DEFAULT 'OPEN'
+            )
+        ''')
+        
+        # Performance metrics table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS performance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                date DATE DEFAULT CURRENT_DATE,
+                total_trades INTEGER DEFAULT 0,
+                winning_trades INTEGER DEFAULT 0,
+                total_pnl REAL DEFAULT 0,
+                account_value REAL DEFAULT 0
+            )
+        ''')
+        
+        conn.commit()
+        conn.close()
+    
+    def log_trade(self, symbol, side, quantity, price, strategy):
+        """Log a trade to the database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO trades (symbol, side, quantity, price, strategy)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (symbol, side, quantity, price, strategy))
+        conn.commit()
+        conn.close()
+    
+    def update_trade_pnl(self, symbol, pnl, status='CLOSED'):
+        """Update trade P&L when position is closed"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE trades SET pnl = ?, status = ?
+            WHERE symbol = ? AND status = 'OPEN'
+            ORDER BY timestamp DESC LIMIT 1
+        ''', (pnl, status, symbol))
+        conn.commit()
+        conn.close()
+
+class EmailNotifier:
+    def __init__(self):
+        self.smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+        self.smtp_port = int(os.getenv('SMTP_PORT', '587'))
+        self.email = os.getenv('NOTIFICATION_EMAIL')
+        self.password = os.getenv('EMAIL_PASSWORD')
+        self.enabled = self.email and self.password
+    
+    def send_notification(self, subject: str, message: str):
+        """Send email notification"""
+        if not self.enabled:
+            return
+        
+        try:
+            msg = MIMEMultipart()
+            msg['From'] = self.email
+            msg['To'] = self.email
+            msg['Subject'] = subject
+            
+            msg.attach(MIMEText(message, 'plain'))
+            
+            with smtplib.SMTP(self.smtp_server, self.smtp_port) as server:
+                server.starttls()
+                server.login(self.email, self.password)
+                server.send_message(msg)
+                
+        except Exception as e:
+            print(f"Failed to send notification: {e}")
+
+class ServerTradingBot:
+    def __init__(self):
+        self.logger = TradingBotLogger().get_logger()
+        self.db = DatabaseManager()
+        self.notifier = EmailNotifier()
+        
+        # Initialize Alpaca API
+        api_key = os.getenv('ALPACA_API_KEY')
+        secret_key = os.getenv('ALPACA_SECRET_KEY')
+        paper_trading = os.getenv('PAPER_TRADING', 'true').lower() == 'true'
+        
+        if not api_key or not secret_key:
+            raise ValueError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in environment variables")
+        
         base_url = 'https://paper-api.alpaca.markets' if paper_trading else 'https://api.alpaca.markets'
         self.api = tradeapi.REST(api_key, secret_key, base_url, api_version='v2')
         
-        # Trading parameters
-        self.position_size = 0.02  # 2% of portfolio per trade
-        self.max_positions = 10
-        self.risk_per_trade = 0.01  # 1% risk per trade
+        # Trading parameters (configurable via environment)
+        self.position_size = float(os.getenv('POSITION_SIZE', '0.02'))
+        self.max_positions = int(os.getenv('MAX_POSITIONS', '10'))
+        self.risk_per_trade = float(os.getenv('RISK_PER_TRADE', '0.01'))
+        self.stop_loss_pct = float(os.getenv('STOP_LOSS_PCT', '0.02'))
+        self.take_profit_pct = float(os.getenv('TAKE_PROFIT_PCT', '0.03'))
         
         # Strategy parameters
-        self.momentum_lookback = 20
-        self.mean_reversion_lookback = 14
-        self.rsi_oversold = 30
-        self.rsi_overbought = 70
+        self.momentum_lookback = int(os.getenv('MOMENTUM_LOOKBACK', '20'))
+        self.rsi_oversold = int(os.getenv('RSI_OVERSOLD', '30'))
+        self.rsi_overbought = int(os.getenv('RSI_OVERBOUGHT', '70'))
         
-        # Data storage
-        self.positions = {}
-        self.market_data = {}
+        # Watchlist
+        watchlist_str = os.getenv('WATCHLIST', 'AAPL,GOOGL,MSFT,AMZN,TSLA,META,NVDA,SPY,QQQ')
+        self.watchlist = [symbol.strip() for symbol in watchlist_str.split(',')]
+        
+        # State management
         self.running = False
+        self.daily_pnl = 0
+        self.daily_max_loss = float(os.getenv('DAILY_MAX_LOSS', '0.05'))  # 5% max daily loss
         
-        # Watchlist for trading
-        self.watchlist = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA', 'META', 'NVDA', 'SPY', 'QQQ']
+        # Setup signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
         
+        self.logger.info("Trading bot initialized successfully")
+    
+    def _signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        self.logger.info(f"Received signal {signum}, shutting down gracefully...")
+        self.running = False
+    
     def get_account_info(self) -> Dict:
-        """Get account information"""
+        """Get account information with error handling"""
         try:
             account = self.api.get_account()
             return {
                 'equity': float(account.equity),
                 'cash': float(account.cash),
                 'buying_power': float(account.buying_power),
-                'day_trade_count': account.day_trade_count
+                'day_trade_count': account.day_trade_count,
+                'pattern_day_trader': account.pattern_day_trader
             }
         except Exception as e:
-            logger.error(f"Error getting account info: {e}")
+            self.logger.error(f"Error getting account info: {e}")
             return {}
     
+    def check_daily_loss_limit(self) -> bool:
+        """Check if daily loss limit has been reached"""
+        account_info = self.get_account_info()
+        if not account_info:
+            return False
+        
+        # Calculate daily P&L (simplified - you might want to track this more precisely)
+        current_equity = account_info['equity']
+        
+        # If loss exceeds daily limit, stop trading
+        if self.daily_pnl < -self.daily_max_loss * current_equity:
+            self.logger.warning(f"Daily loss limit reached: {self.daily_pnl:.2f}")
+            self.notifier.send_notification(
+                "Trading Bot - Daily Loss Limit",
+                f"Daily loss limit reached: ${self.daily_pnl:.2f}. Trading suspended."
+            )
+            return True
+        
+        return False
+    
     def get_market_data(self, symbol: str, timeframe: str = '1Min', limit: int = 1000) -> pd.DataFrame:
-        """Get historical market data"""
+        """Get historical market data with caching"""
         try:
             end_time = datetime.now()
             start_time = end_time - timedelta(days=30)
@@ -75,6 +242,9 @@ class AlpacaTradingBot:
                 end=end_time.isoformat(),
                 limit=limit
             )
+            
+            if not bars:
+                return pd.DataFrame()
             
             df = pd.DataFrame([{
                 'timestamp': bar.t,
@@ -92,155 +262,129 @@ class AlpacaTradingBot:
             return df
             
         except Exception as e:
-            logger.error(f"Error getting market data for {symbol}: {e}")
+            self.logger.error(f"Error getting market data for {symbol}: {e}")
             return pd.DataFrame()
     
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators"""
+        """Calculate technical indicators with error handling"""
         if df.empty or len(df) < 50:
             return df
             
         try:
+            # Ensure we have enough data
+            close_prices = df['close'].values
+            high_prices = df['high'].values
+            low_prices = df['low'].values
+            volume = df['volume'].values
+            
             # Price-based indicators
-            df['sma_20'] = talib.SMA(df['close'], timeperiod=20)
-            df['sma_50'] = talib.SMA(df['close'], timeperiod=50)
-            df['ema_12'] = talib.EMA(df['close'], timeperiod=12)
-            df['ema_26'] = talib.EMA(df['close'], timeperiod=26)
+            df['sma_20'] = talib.SMA(close_prices, timeperiod=20)
+            df['sma_50'] = talib.SMA(close_prices, timeperiod=50)
+            df['ema_12'] = talib.EMA(close_prices, timeperiod=12)
+            df['ema_26'] = talib.EMA(close_prices, timeperiod=26)
             
             # Momentum indicators
-            df['rsi'] = talib.RSI(df['close'], timeperiod=14)
-            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(df['close'])
+            df['rsi'] = talib.RSI(close_prices, timeperiod=14)
+            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(close_prices)
             
             # Volatility indicators
-            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(df['close'])
-            df['atr'] = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(close_prices)
+            df['atr'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
             
             # Volume indicators
-            df['volume_sma'] = talib.SMA(df['volume'], timeperiod=20)
+            df['volume_sma'] = talib.SMA(volume.astype(float), timeperiod=20)
             
-            # Price momentum
+            # Custom indicators
             df['price_change'] = df['close'].pct_change()
             df['momentum'] = df['close'] / df['close'].shift(self.momentum_lookback) - 1
             
             return df
             
         except Exception as e:
-            logger.error(f"Error calculating technical indicators: {e}")
+            self.logger.error(f"Error calculating technical indicators: {e}")
             return df
     
     def momentum_strategy(self, df: pd.DataFrame, symbol: str) -> Optional[str]:
-        """
-        Momentum trading strategy
-        Buy when price breaks above resistance with strong volume
-        """
+        """Enhanced momentum strategy with multiple confirmations"""
         if df.empty or len(df) < 50:
             return None
             
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
-        
         try:
+            latest = df.iloc[-1]
+            prev = df.iloc[-2]
+            
+            # Check for NaN values
+            required_fields = ['momentum', 'close', 'sma_20', 'volume', 'volume_sma', 'rsi', 'bb_lower', 'bb_upper']
+            if any(pd.isna(latest[field]) for field in required_fields):
+                return None
+            
             # Momentum conditions
-            momentum_up = latest['momentum'] > 0.02  # 2% momentum
+            momentum_strong = latest['momentum'] > 0.02  # 2% momentum
             price_above_sma = latest['close'] > latest['sma_20']
             volume_surge = latest['volume'] > latest['volume_sma'] * 1.5
             rsi_not_overbought = latest['rsi'] < 75
+            macd_bullish = latest['macd'] > latest['macd_signal'] if not pd.isna(latest['macd']) else False
             
             # Mean reversion conditions
             rsi_oversold = latest['rsi'] < self.rsi_oversold
             price_below_bb = latest['close'] < latest['bb_lower']
+            oversold_bounce = latest['close'] > prev['close'] and rsi_oversold
             
-            if momentum_up and price_above_sma and volume_surge and rsi_not_overbought:
+            # Exit conditions
+            rsi_overbought_exit = latest['rsi'] > self.rsi_overbought
+            price_above_bb = latest['close'] > latest['bb_upper']
+            
+            # Entry signals
+            if momentum_strong and price_above_sma and volume_surge and rsi_not_overbought and macd_bullish:
                 return 'BUY_MOMENTUM'
-            elif rsi_oversold and price_below_bb:
+            elif oversold_bounce and price_below_bb:
                 return 'BUY_MEAN_REVERSION'
-            elif latest['rsi'] > self.rsi_overbought and latest['close'] > latest['bb_upper']:
+            elif rsi_overbought_exit and price_above_bb:
                 return 'SELL'
                 
         except Exception as e:
-            logger.error(f"Error in momentum strategy for {symbol}: {e}")
+            self.logger.error(f"Error in momentum strategy for {symbol}: {e}")
             
         return None
     
-    def arbitrage_opportunity(self, symbol: str) -> Optional[Dict]:
-        """
-        Simple arbitrage detection (price discrepancies)
-        In practice, this would compare prices across different exchanges
-        """
-        try:
-            # Get current quote
-            quote = self.api.get_latest_quote(symbol)
-            bid = quote.bid_price
-            ask = quote.ask_price
-            spread = ask - bid
-            
-            # Check for unusually wide spreads that might indicate opportunity
-            if spread > 0.05:  # 5 cent spread threshold
-                return {
-                    'symbol': symbol,
-                    'bid': bid,
-                    'ask': ask,
-                    'spread': spread,
-                    'opportunity': 'WIDE_SPREAD'
-                }
-                
-        except Exception as e:
-            logger.error(f"Error checking arbitrage for {symbol}: {e}")
-            
-        return None
-    
-    def calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float) -> int:
-        """Calculate position size based on risk management"""
-        try:
-            account_info = self.get_account_info()
-            if not account_info:
-                return 0
-                
-            equity = account_info['equity']
-            risk_amount = equity * self.risk_per_trade
-            
-            # Calculate risk per share
-            risk_per_share = abs(entry_price - stop_loss)
-            if risk_per_share <= 0:
-                return 0
-                
-            # Calculate shares to buy
-            shares = int(risk_amount / risk_per_share)
-            
-            # Check if we have enough buying power
-            cost = shares * entry_price
-            if cost > account_info['buying_power']:
-                shares = int(account_info['buying_power'] * self.position_size / entry_price)
-                
-            return max(1, shares)
-            
-        except Exception as e:
-            logger.error(f"Error calculating position size: {e}")
-            return 0
-    
-    def place_order(self, symbol: str, side: str, shares: int, order_type: str = 'market') -> bool:
-        """Place a trading order"""
+    def place_order(self, symbol: str, side: str, shares: int, strategy: str) -> bool:
+        """Place order with database logging"""
         try:
             if shares <= 0:
                 return False
-                
+            
+            # Get current price for logging
+            quote = self.api.get_latest_quote(symbol)
+            current_price = (quote.bid_price + quote.ask_price) / 2
+            
             order = self.api.submit_order(
                 symbol=symbol,
                 qty=shares,
                 side=side,
-                type=order_type,
+                type='market',
                 time_in_force='day'
             )
             
-            logger.info(f"Order placed: {side} {shares} shares of {symbol} - Order ID: {order.id}")
+            # Log to database
+            self.db.log_trade(symbol, side, shares, current_price, strategy)
+            
+            self.logger.info(f"Order placed: {side} {shares} shares of {symbol} at ${current_price:.2f} - Strategy: {strategy}")
+            
+            # Send notification for significant trades
+            if shares * current_price > 1000:  # Notify for trades > $1000
+                self.notifier.send_notification(
+                    f"Trading Bot - Large Trade",
+                    f"{side.upper()} {shares} shares of {symbol} at ${current_price:.2f}"
+                )
+            
             return True
             
         except Exception as e:
-            logger.error(f"Error placing order for {symbol}: {e}")
+            self.logger.error(f"Error placing order for {symbol}: {e}")
             return False
     
     def manage_positions(self):
-        """Manage existing positions - stop losses, take profits"""
+        """Enhanced position management with database updates"""
         try:
             positions = self.api.list_positions()
             
@@ -249,246 +393,265 @@ class AlpacaTradingBot:
                 qty = int(position.qty)
                 current_price = float(position.current_price)
                 unrealized_pl = float(position.unrealized_pl)
+                cost_basis = float(position.cost_basis)
                 
-                # Get market data for the position
+                # Calculate percentage P&L
+                pnl_pct = unrealized_pl / abs(cost_basis) if cost_basis != 0 else 0
+                
+                # Get technical data
                 df = self.get_market_data(symbol, '1Min', 100)
                 if df.empty:
                     continue
                     
                 df = self.calculate_technical_indicators(df)
+                if df.empty or len(df) < 2:
+                    continue
+                    
                 latest = df.iloc[-1]
                 
                 # Exit conditions
                 should_exit = False
                 exit_reason = ""
                 
-                # Stop loss: 2% loss
-                if unrealized_pl < -0.02 * float(position.market_value):
+                # Stop loss
+                if pnl_pct < -self.stop_loss_pct:
                     should_exit = True
                     exit_reason = "Stop Loss"
                 
-                # Take profit: 3% gain
-                elif unrealized_pl > 0.03 * float(position.market_value):
+                # Take profit
+                elif pnl_pct > self.take_profit_pct:
                     should_exit = True
                     exit_reason = "Take Profit"
                 
-                # Technical exit conditions
-                elif qty > 0 and latest['rsi'] > 75:  # Long position, RSI overbought
+                # Technical exits
+                elif qty > 0 and not pd.isna(latest['rsi']) and latest['rsi'] > 75:
                     should_exit = True
                     exit_reason = "RSI Overbought"
                 
-                elif qty < 0 and latest['rsi'] < 25:  # Short position, RSI oversold
+                elif qty < 0 and not pd.isna(latest['rsi']) and latest['rsi'] < 25:
                     should_exit = True
                     exit_reason = "RSI Oversold"
                 
+                # Time-based exit (hold max 1 day for momentum trades)
+                # This would require tracking entry time, simplified here
+                
                 if should_exit:
                     side = 'sell' if qty > 0 else 'buy'
-                    if self.place_order(symbol, side, abs(qty)):
-                        logger.info(f"Position closed: {symbol} - Reason: {exit_reason}")
+                    if self.place_order(symbol, side, abs(qty), f"EXIT_{exit_reason}"):
+                        # Update database with final P&L
+                        self.db.update_trade_pnl(symbol, unrealized_pl, 'CLOSED')
+                        self.daily_pnl += unrealized_pl
+                        
+                        self.logger.info(f"Position closed: {symbol} - P&L: ${unrealized_pl:.2f} - Reason: {exit_reason}")
                         
         except Exception as e:
-            logger.error(f"Error managing positions: {e}")
+            self.logger.error(f"Error managing positions: {e}")
     
-    def scan_opportunities(self):
-        """Scan for trading opportunities"""
-        opportunities = []
-        
-        for symbol in self.watchlist:
-            try:
-                # Get market data
-                df = self.get_market_data(symbol, '1Min', 200)
-                if df.empty:
-                    continue
-                    
-                df = self.calculate_technical_indicators(df)
-                
-                # Check for momentum/mean reversion signals
-                signal = self.momentum_strategy(df, symbol)
-                if signal:
-                    opportunities.append({
-                        'symbol': symbol,
-                        'signal': signal,
-                        'data': df.iloc[-1]
-                    })
-                
-                # Check for arbitrage opportunities
-                arb = self.arbitrage_opportunity(symbol)
-                if arb:
-                    opportunities.append({
-                        'symbol': symbol,
-                        'signal': 'ARBITRAGE',
-                        'data': arb
-                    })
-                    
-            except Exception as e:
-                logger.error(f"Error scanning {symbol}: {e}")
-                continue
-                
-        return opportunities
-    
-    def execute_trades(self, opportunities: List[Dict]):
-        """Execute trades based on opportunities"""
-        current_positions = len(self.api.list_positions())
-        
-        for opp in opportunities:
-            if current_positions >= self.max_positions:
-                break
-                
-            symbol = opp['symbol']
-            signal = opp['signal']
+    def health_check(self):
+        """Perform system health checks"""
+        try:
+            # Check API connection
+            self.api.get_clock()
             
-            try:
-                # Check if we already have a position
-                try:
-                    position = self.api.get_position(symbol)
-                    if position:
-                        continue  # Skip if we already have a position
-                except:
-                    pass  # No position exists, continue
-                
-                # Get current price
-                quote = self.api.get_latest_quote(symbol)
-                current_price = (quote.bid_price + quote.ask_price) / 2
-                
-                if signal in ['BUY_MOMENTUM', 'BUY_MEAN_REVERSION']:
-                    # Calculate stop loss (2% below entry)
-                    stop_loss = current_price * 0.98
-                    
-                    # Calculate position size
-                    shares = self.calculate_position_size(symbol, current_price, stop_loss)
-                    
-                    if shares > 0:
-                        if self.place_order(symbol, 'buy', shares):
-                            logger.info(f"Bought {shares} shares of {symbol} at ${current_price:.2f} - Signal: {signal}")
-                            current_positions += 1
-                
-                elif signal == 'ARBITRAGE':
-                    # Simple arbitrage execution
-                    shares = 100  # Fixed size for arbitrage
-                    if self.place_order(symbol, 'buy', shares):
-                        logger.info(f"Arbitrage trade: {symbol} - {opp['data']}")
-                        current_positions += 1
-                        
-            except Exception as e:
-                logger.error(f"Error executing trade for {symbol}: {e}")
+            # Check account status
+            account = self.get_account_info()
+            if not account:
+                raise Exception("Cannot access account information")
+            
+            # Check if account is restricted
+            if account.get('trading_blocked', False):
+                raise Exception("Account trading is blocked")
+            
+            # Check buying power
+            if account.get('buying_power', 0) < 100:
+                self.logger.warning("Low buying power detected")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Health check failed: {e}")
+            self.notifier.send_notification(
+                "Trading Bot - Health Check Failed",
+                f"Bot health check failed: {str(e)}"
+            )
+            return False
     
-    def run_trading_loop(self):
-        """Main trading loop"""
+    def daily_report(self):
+        """Generate and send daily performance report"""
+        try:
+            account_info = self.get_account_info()
+            positions = self.api.list_positions()
+            
+            report = f"""
+Daily Trading Report - {datetime.now().strftime('%Y-%m-%d')}
+
+Account Summary:
+- Equity: ${account_info.get('equity', 0):,.2f}
+- Cash: ${account_info.get('cash', 0):,.2f}
+- Day Trade Count: {account_info.get('day_trade_count', 0)}
+
+Active Positions: {len(positions)}
+Daily P&L: ${self.daily_pnl:.2f}
+
+Bot Status: {'Running' if self.running else 'Stopped'}
+"""
+            
+            self.logger.info("Daily report generated")
+            self.notifier.send_notification("Trading Bot - Daily Report", report)
+            
+            # Reset daily P&L
+            self.daily_pnl = 0
+            
+        except Exception as e:
+            self.logger.error(f"Error generating daily report: {e}")
+    
+    def scan_and_trade(self):
+        """Main scanning and trading logic"""
+        try:
+            # Check if we should continue trading
+            if self.check_daily_loss_limit():
+                return
+            
+            # Manage existing positions first
+            self.manage_positions()
+            
+            # Check current position count
+            current_positions = len(self.api.list_positions())
+            if current_positions >= self.max_positions:
+                self.logger.info(f"Maximum positions ({self.max_positions}) reached")
+                return
+            
+            # Scan for opportunities
+            opportunities = []
+            
+            for symbol in self.watchlist:
+                try:
+                    # Skip if we already have a position
+                    try:
+                        position = self.api.get_position(symbol)
+                        if position:
+                            continue
+                    except:
+                        pass  # No position, continue
+                    
+                    # Get market data
+                    df = self.get_market_data(symbol, '1Min', 200)
+                    if df.empty:
+                        continue
+                    
+                    df = self.calculate_technical_indicators(df)
+                    if df.empty:
+                        continue
+                    
+                    # Check for signals
+                    signal = self.momentum_strategy(df, symbol)
+                    if signal and signal.startswith('BUY'):
+                        opportunities.append({
+                            'symbol': symbol,
+                            'signal': signal,
+                            'data': df.iloc[-1]
+                        })
+                        
+                except Exception as e:
+                    self.logger.error(f"Error scanning {symbol}: {e}")
+                    continue
+            
+            # Execute trades
+            if opportunities:
+                self.logger.info(f"Found {len(opportunities)} opportunities")
+                
+                for opp in opportunities[:3]:  # Limit to 3 new positions per scan
+                    if current_positions >= self.max_positions:
+                        break
+                    
+                    symbol = opp['symbol']
+                    signal = opp['signal']
+                    
+                    try:
+                        # Get current price
+                        quote = self.api.get_latest_quote(symbol)
+                        current_price = (quote.bid_price + quote.ask_price) / 2
+                        
+                        # Calculate position size
+                        account_info = self.get_account_info()
+                        if not account_info:
+                            continue
+                            
+                        position_value = account_info['equity'] * self.position_size
+                        shares = max(1, int(position_value / current_price))
+                        
+                        # Check if we have enough buying power
+                        cost = shares * current_price
+                        if cost > account_info['buying_power']:
+                            shares = max(1, int(account_info['buying_power'] * 0.95 / current_price))
+                        
+                        if self.place_order(symbol, 'buy', shares, signal):
+                            current_positions += 1
+                            
+                    except Exception as e:
+                        self.logger.error(f"Error executing trade for {symbol}: {e}")
+            
+        except Exception as e:
+            self.logger.error(f"Error in scan_and_trade: {e}")
+    
+    def run(self):
+        """Main bot execution loop"""
         self.running = True
-        logger.info("Starting trading bot...")
+        self.logger.info("Trading bot started")
+        
+        # Schedule daily report
+        schedule.every().day.at("16:00").do(self.daily_report)  # 4 PM EST
+        
+        # Send startup notification
+        self.notifier.send_notification(
+            "Trading Bot Started",
+            f"Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        
+        last_health_check = datetime.now()
         
         while self.running:
             try:
                 # Check market hours
                 clock = self.api.get_clock()
                 if not clock.is_open:
-                    logger.info("Market is closed, waiting...")
-                    time.sleep(60)
+                    self.logger.info("Market is closed, waiting...")
+                    time.sleep(300)  # Check every 5 minutes when market is closed
                     continue
                 
-                # Manage existing positions
-                self.manage_positions()
+                # Perform health check every hour
+                if datetime.now() - last_health_check > timedelta(hours=1):
+                    if not self.health_check():
+                        self.logger.error("Health check failed, continuing with caution...")
+                    last_health_check = datetime.now()
                 
-                # Scan for new opportunities
-                opportunities = self.scan_opportunities()
+                # Main trading logic
+                self.scan_and_trade()
                 
-                if opportunities:
-                    logger.info(f"Found {len(opportunities)} opportunities")
-                    self.execute_trades(opportunities)
+                # Run scheduled tasks
+                schedule.run_pending()
                 
                 # Wait before next iteration
-                time.sleep(30)  # Run every 30 seconds
+                time.sleep(60)  # Run every minute during market hours
                 
             except KeyboardInterrupt:
-                logger.info("Stopping trading bot...")
-                self.running = False
+                self.logger.info("Received interrupt signal, shutting down...")
                 break
             except Exception as e:
-                logger.error(f"Error in trading loop: {e}")
-                time.sleep(60)
-    
-    def backtest_strategy(self, symbol: str, days: int = 30) -> Dict:
-        """Simple backtesting functionality"""
-        try:
-            # Get historical data
-            end_date = datetime.now()
-            start_date = end_date - timedelta(days=days)
-            
-            df = self.get_market_data(symbol, '1Day', days)
-            if df.empty:
-                return {}
-                
-            df = self.calculate_technical_indicators(df)
-            
-            # Simulate trades
-            trades = []
-            position = 0
-            entry_price = 0
-            
-            for i in range(50, len(df)):
-                current_data = df.iloc[i]
-                signal = self.momentum_strategy(df.iloc[:i+1], symbol)
-                
-                if signal == 'BUY_MOMENTUM' and position == 0:
-                    position = 1
-                    entry_price = current_data['close']
-                    trades.append({
-                        'date': current_data.name,
-                        'action': 'BUY',
-                        'price': entry_price,
-                        'signal': signal
-                    })
-                
-                elif signal == 'SELL' and position == 1:
-                    position = 0
-                    exit_price = current_data['close']
-                    pnl = (exit_price - entry_price) / entry_price
-                    trades.append({
-                        'date': current_data.name,
-                        'action': 'SELL',
-                        'price': exit_price,
-                        'pnl': pnl,
-                        'signal': signal
-                    })
-            
-            # Calculate performance metrics
-            if trades:
-                total_pnl = sum([t.get('pnl', 0) for t in trades])
-                win_rate = len([t for t in trades if t.get('pnl', 0) > 0]) / len([t for t in trades if 'pnl' in t])
-                
-                return {
-                    'symbol': symbol,
-                    'total_trades': len(trades),
-                    'total_pnl': total_pnl,
-                    'win_rate': win_rate,
-                    'trades': trades
-                }
-            
-        except Exception as e:
-            logger.error(f"Error in backtest: {e}")
-            
-        return {}
+                self.logger.error(f"Error in main loop: {e}")
+                time.sleep(300)  # Wait 5 minutes before retrying
+        
+        # Cleanup
+        self.logger.info("Trading bot stopped")
+        self.notifier.send_notification(
+            "Trading Bot Stopped",
+            f"Bot stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
 
-# Example usage
 if __name__ == "__main__":
-    # Initialize bot (use your actual API keys)
-    bot = AlpacaTradingBot(
-        api_key="YOUR_API_KEY",
-        secret_key="YOUR_SECRET_KEY",
-        paper_trading=True  # Start with paper trading
-    )
-    
-    # Check account info
-    account = bot.get_account_info()
-    print(f"Account Equity: ${account.get('equity', 0):,.2f}")
-    
-    # Run backtest
-    backtest_result = bot.backtest_strategy('AAPL', days=60)
-    if backtest_result:
-        print(f"Backtest Results for {backtest_result['symbol']}:")
-        print(f"Total Trades: {backtest_result['total_trades']}")
-        print(f"Total P&L: {backtest_result['total_pnl']:.2%}")
-        print(f"Win Rate: {backtest_result['win_rate']:.2%}")
-    
-    # Uncomment to run the trading loop
-    # bot.run_trading_loop()
+    try:
+        bot = ServerTradingBot()
+        bot.run()
+    except Exception as e:
+        print(f"Failed to start trading bot: {e}")
+        sys.exit(1)

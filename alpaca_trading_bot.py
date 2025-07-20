@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Server-optimized Alpaca Trading Bot for OCI VM deployment
+Modified to use 'ta' library instead of TA-Lib
 """
 
 import alpaca_trade_api as tradeapi
@@ -18,7 +19,7 @@ from typing import Dict, List, Tuple, Optional
 import asyncio
 import websocket
 from concurrent.futures import ThreadPoolExecutor
-import talib
+import ta  # Using 'ta' instead of talib
 from dotenv import load_dotenv
 import schedule
 import sqlite3
@@ -266,33 +267,38 @@ class ServerTradingBot:
             return pd.DataFrame()
     
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators with error handling"""
+        """Calculate technical indicators using 'ta' library instead of talib"""
         if df.empty or len(df) < 50:
             return df
             
         try:
-            # Ensure we have enough data
-            close_prices = df['close'].values
-            high_prices = df['high'].values
-            low_prices = df['low'].values
-            volume = df['volume'].values
-            
-            # Price-based indicators
-            df['sma_20'] = talib.SMA(close_prices, timeperiod=20)
-            df['sma_50'] = talib.SMA(close_prices, timeperiod=50)
-            df['ema_12'] = talib.EMA(close_prices, timeperiod=12)
-            df['ema_26'] = talib.EMA(close_prices, timeperiod=26)
+            # Moving averages using ta library
+            df['sma_20'] = ta.trend.sma_indicator(df['close'], window=20)
+            df['sma_50'] = ta.trend.sma_indicator(df['close'], window=50)
+            df['ema_12'] = ta.trend.ema_indicator(df['close'], window=12)
+            df['ema_26'] = ta.trend.ema_indicator(df['close'], window=26)
             
             # Momentum indicators
-            df['rsi'] = talib.RSI(close_prices, timeperiod=14)
-            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(close_prices)
+            df['rsi'] = ta.momentum.rsi(df['close'], window=14)
             
-            # Volatility indicators
-            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(close_prices)
-            df['atr'] = talib.ATR(high_prices, low_prices, close_prices, timeperiod=14)
+            # MACD
+            macd_line = ta.trend.macd(df['close'])
+            macd_signal = ta.trend.macd_signal(df['close'])
+            df['macd'] = macd_line
+            df['macd_signal'] = macd_signal
+            df['macd_hist'] = macd_line - macd_signal
+            
+            # Bollinger Bands
+            bb_indicator = ta.volatility.BollingerBands(df['close'])
+            df['bb_upper'] = bb_indicator.bollinger_hband()
+            df['bb_middle'] = bb_indicator.bollinger_mavg()
+            df['bb_lower'] = bb_indicator.bollinger_lband()
+            
+            # Average True Range
+            df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'])
             
             # Volume indicators
-            df['volume_sma'] = talib.SMA(volume.astype(float), timeperiod=20)
+            df['volume_sma'] = ta.trend.sma_indicator(df['volume'], window=20)
             
             # Custom indicators
             df['price_change'] = df['close'].pct_change()
@@ -432,9 +438,6 @@ class ServerTradingBot:
                     should_exit = True
                     exit_reason = "RSI Oversold"
                 
-                # Time-based exit (hold max 1 day for momentum trades)
-                # This would require tracking entry time, simplified here
-                
                 if should_exit:
                     side = 'sell' if qty > 0 else 'buy'
                     if self.place_order(symbol, side, abs(qty), f"EXIT_{exit_reason}"):
@@ -549,109 +552,6 @@ Bot Status: {'Running' if self.running else 'Stopped'}
                         opportunities.append({
                             'symbol': symbol,
                             'signal': signal,
-                            'data': df.iloc[-1]
-                        })
-                        
-                except Exception as e:
-                    self.logger.error(f"Error scanning {symbol}: {e}")
-                    continue
-            
-            # Execute trades
-            if opportunities:
-                self.logger.info(f"Found {len(opportunities)} opportunities")
-                
-                for opp in opportunities[:3]:  # Limit to 3 new positions per scan
-                    if current_positions >= self.max_positions:
-                        break
-                    
-                    symbol = opp['symbol']
-                    signal = opp['signal']
-                    
-                    try:
-                        # Get current price
-                        quote = self.api.get_latest_quote(symbol)
-                        current_price = (quote.bid_price + quote.ask_price) / 2
-                        
-                        # Calculate position size
-                        account_info = self.get_account_info()
-                        if not account_info:
-                            continue
-                            
-                        position_value = account_info['equity'] * self.position_size
-                        shares = max(1, int(position_value / current_price))
-                        
-                        # Check if we have enough buying power
-                        cost = shares * current_price
-                        if cost > account_info['buying_power']:
-                            shares = max(1, int(account_info['buying_power'] * 0.95 / current_price))
-                        
-                        if self.place_order(symbol, 'buy', shares, signal):
-                            current_positions += 1
-                            
-                    except Exception as e:
-                        self.logger.error(f"Error executing trade for {symbol}: {e}")
-            
-        except Exception as e:
-            self.logger.error(f"Error in scan_and_trade: {e}")
-    
-    def run(self):
-        """Main bot execution loop"""
-        self.running = True
-        self.logger.info("Trading bot started")
-        
-        # Schedule daily report
-        schedule.every().day.at("16:00").do(self.daily_report)  # 4 PM EST
-        
-        # Send startup notification
-        self.notifier.send_notification(
-            "Trading Bot Started",
-            f"Bot started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        
-        last_health_check = datetime.now()
-        
-        while self.running:
-            try:
-                # Check market hours
-                clock = self.api.get_clock()
-                if not clock.is_open:
-                    self.logger.info("Market is closed, waiting...")
-                    time.sleep(300)  # Check every 5 minutes when market is closed
-                    continue
-                
-                # Perform health check every hour
-                if datetime.now() - last_health_check > timedelta(hours=1):
-                    if not self.health_check():
-                        self.logger.error("Health check failed, continuing with caution...")
-                    last_health_check = datetime.now()
-                
-                # Main trading logic
-                self.scan_and_trade()
-                
-                # Run scheduled tasks
-                schedule.run_pending()
-                
-                # Wait before next iteration
-                time.sleep(60)  # Run every minute during market hours
-                
-            except KeyboardInterrupt:
-                self.logger.info("Received interrupt signal, shutting down...")
-                break
-            except Exception as e:
-                self.logger.error(f"Error in main loop: {e}")
-                time.sleep(300)  # Wait 5 minutes before retrying
-        
-        # Cleanup
-        self.logger.info("Trading bot stopped")
-        self.notifier.send_notification(
-            "Trading Bot Stopped",
-            f"Bot stopped at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-
-if __name__ == "__main__":
-    try:
-        bot = ServerTradingBot()
-        bot.run()
     except Exception as e:
         print(f"Failed to start trading bot: {e}")
         sys.exit(1)
